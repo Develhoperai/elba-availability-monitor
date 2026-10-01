@@ -1,0 +1,63 @@
+name: Public availability check
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+permissions: {contents: read}
+concurrency: {group: elba-availability, cancel-in-progress: false}
+jobs:
+  monitor:
+    if: github.repository == 'Develhoperai/elba-availability-monitor' && github.event.schedule != '17 4 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Check public TLS and authentication boundary
+        env:
+          MONITOR_IDENTITY: ${{ secrets.ELBA_MONITOR_SSH }}
+          MONITOR_HOST_KEY: ${{ vars.ELBA_MONITOR_HOST_KEY }}
+          MONITOR_HOST: ${{ vars.ELBA_MONITOR_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$MONITOR_IDENTITY" > ~/.ssh/elba-monitor
+          chmod 600 ~/.ssh/elba-monitor
+          printf '%s\n' "$MONITOR_HOST_KEY" > ~/.ssh/known_hosts
+          python3 - <<'PY'
+          import json, urllib.request, urllib.error, time
+          report={'status':'FAIL','tls_verified':False,'anonymous_data_denied':False}
+          for attempt in range(3):
+              try:
+                  with urllib.request.urlopen('https://elba.futuristik.it/health/ready',timeout=15) as response:
+                      assert json.load(response)['status']=='ready'
+                  report['tls_verified']=True
+                  try:
+                      urllib.request.urlopen('https://elba.futuristik.it/api/workspace',timeout=10)
+                  except urllib.error.HTTPError as error:
+                      assert error.code==403
+                      report['anonymous_data_denied']=True
+                  assert report['anonymous_data_denied']
+                  report['status']='PASS';break
+              except (OSError,ValueError,AssertionError):
+                  if attempt<2:time.sleep(3)
+          with open('/tmp/elba-monitor.json','w') as output:json.dump(report,output)
+          PY
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -i ~/.ssh/elba-monitor "$MONITOR_HOST" monitor < /tmp/elba-monitor.json
+          python3 -c "import json; assert json.load(open('/tmp/elba-monitor.json'))['status']=='PASS'"
+      - name: Remove temporary identity
+        if: always()
+        run: rm -f ~/.ssh/elba-monitor /tmp/elba-monitor.json
+  keepalive:
+    if: github.repository == 'Develhoperai/elba-availability-monitor' && github.event.schedule == '17 4 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {contents: write}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Record weekly scheduler activity
+        run: |
+          date -u +%Y-%m-%d > .scheduler-activity
+          git config user.name 'Elba availability service'
+          git config user.email 'elba-monitor@users.noreply.github.com'
+          git add .scheduler-activity
+          git commit -m 'Record scheduled availability service activity'
+          git push
